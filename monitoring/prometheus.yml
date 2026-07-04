@@ -1,0 +1,17 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Spring Boot Actuator exposes Prometheus-formatted metrics at this path
+  - job_name: "taskmaster-app"
+    metrics_path: "/actuator/prometheus"
+    static_configs:
+      # For local testing:
+      - targets: ["host.docker.internal:8080"]
+      # For hitting the deployed ALB instead, comment the line above and use:
+      # - targets: ["<your-alb-dns-name>:80"]
+
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]

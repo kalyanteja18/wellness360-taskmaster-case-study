@@ -1,0 +1,30 @@
+# Local monitoring stack — lets you demo Prometheus + Grafana without
+# needing the full AWS deployment running. Point Prometheus at your
+# local app (localhost:8080) or the ALB DNS name once deployed.
+
+version: "3.8"
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./grafana-dashboards:/var/lib/grafana/dashboards
+      - ./grafana-provisioning:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
