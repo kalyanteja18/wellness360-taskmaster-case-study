@@ -1,0 +1,129 @@
+name: Build, Test, and Deploy to ECS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: taskmaster-app
+  ECS_CLUSTER: taskmaster-cluster
+  ECS_SERVICE: taskmaster-service
+  CONTAINER_NAME: taskmaster-app
+
+jobs:
+  # ---------- Stage 1: Build & Test ----------
+  build-and-test:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.vars.outputs.image_tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+          cache: maven
+
+      - name: Run unit & integration tests
+        run: mvn -B test
+
+      - name: Build application JAR
+        run: mvn -B clean package -DskipTests
+
+      - name: Set image tag (short commit SHA)
+        id: vars
+        run: echo "image_tag=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+
+  # ---------- Stage 2: Build image, push to ECR ----------
+  build-and-push-image:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    outputs:
+      registry: ${{ steps.ecr-login.outputs.registry }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ needs.build-and-test.outputs.image_tag }}
+        run: |
+          docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" -t "$ECR_REGISTRY/$ECR_REPOSITORY:latest" .
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+
+  # ---------- Stage 3: Deploy to ECS ----------
+  deploy-to-ecs:
+    needs: [build-and-test, build-and-push-image]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition taskmaster-task \
+            --query taskDefinition > task-definition.json
+
+      - name: Render new image into task definition
+        id: render-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ needs.build-and-push-image.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.build-and-test.outputs.image_tag }}
+
+      - name: Deploy updated task definition to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+  # ---------- Stage 4: Post-deploy smoke test ----------
+  smoke-test:
+    needs: deploy-to-ecs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Hit the health endpoint
+        env:
+          APP_URL: ${{ secrets.ALB_DNS_NAME }}
+        run: |
+          for i in {1..10}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://$APP_URL/actuator/health" || echo "000")
+            if [ "$STATUS" -eq 200 ]; then
+              echo "Smoke test passed — app is healthy."
+              exit 0
+            fi
+            echo "Attempt $i: got status $STATUS, retrying in 15s..."
+            sleep 15
+          done
+          echo "Smoke test failed — app did not become healthy in time."
+          exit 1cd ..
